@@ -61,6 +61,7 @@ type Client struct {
 	frameSeq      uint64
 	audioSeq      uint64
 	lastFrameUnix int64 // unix nanos
+	nightErr      atomic.Bool
 	tracked       bool
 	autonomy      bool
 	dockSession   bool
@@ -82,6 +83,18 @@ type Config struct {
 	MasterAddress string
 	Host          string
 	NodeName      string
+}
+
+func NewOfflineClient() *Client {
+	c := &Client{
+		tracked:  true,
+		h264Subs: map[uint64]func(VideoPacket){},
+		aacSubs:  map[uint64]func(AudioPacket){},
+		logSubs:  map[uint64]func(LogLine){},
+		logs:     make([]LogLine, 0, 200),
+	}
+	c.Log("warn", "Scout offline — waiting for ROS")
+	return c
 }
 
 func Connect(cfg Config) (*Client, error) {
@@ -341,6 +354,10 @@ func (c *Client) Logs() []LogLine {
 	return out
 }
 
+func (c *Client) Connected() bool {
+	return c.node != nil
+}
+
 func (c *Client) OnH264(cb func(VideoPacket)) (cancel func()) {
 	c.mu.Lock()
 	c.h264ID++
@@ -509,13 +526,17 @@ func (c *Client) endBackupSub() {
 	}
 }
 
-func (c *Client) publishTwist(x, y, az float64) {
+func (c *Client) publishTwist(x, y, az float64) error {
 	c.cmdMu.Lock()
 	defer c.cmdMu.Unlock()
+	if c.cmdPub == nil {
+		return fmt.Errorf("Scout is offline")
+	}
 	c.cmdPub.Write(&geometry_msgs.Twist{
 		Linear:  geometry_msgs.Vector3{X: x, Y: y, Z: 0},
 		Angular: geometry_msgs.Vector3{X: 0, Y: 0, Z: az},
 	})
+	return nil
 }
 
 func (c *Client) Drive(x, y, az float64) error {
@@ -528,11 +549,10 @@ func (c *Client) Drive(x, y, az float64) error {
 	c.wasDriving = moving
 	c.mu.Unlock()
 	if moving {
-		c.publishTwist(x, y, az)
-		return nil
+		return c.publishTwist(x, y, az)
 	}
 	if was {
-		c.publishTwist(0, 0, 0)
+		return c.publishTwist(0, 0, 0)
 	}
 	return nil
 }
@@ -541,8 +561,7 @@ func (c *Client) Stop() error {
 	c.mu.Lock()
 	c.wasDriving = false
 	c.mu.Unlock()
-	c.publishTwist(0, 0, 0)
-	return nil
+	return c.publishTwist(0, 0, 0)
 }
 
 func (c *Client) ForceStop() error {
@@ -634,8 +653,13 @@ func (c *Client) VideoMode() (nightMode, cameraLight int32) {
 func (c *Client) RefreshNight() {
 	res, err := c.NightGet()
 	if err != nil {
-		c.Log("warn", "night_get: "+err.Error())
+		if c.nightErr.CompareAndSwap(false, true) {
+			c.Log("warn", "night_get: "+err.Error())
+		}
 		return
+	}
+	if c.nightErr.Swap(false) {
+		c.Log("info", "night_get recovered")
 	}
 	c.mu.Lock()
 	c.night = &res

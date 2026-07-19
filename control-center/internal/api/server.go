@@ -26,6 +26,9 @@ type Server struct {
 	pilotMu    sync.Mutex
 	pilotSeq   atomic.Uint64
 	pilotOwner uint64
+	rosMu      sync.RWMutex
+	wsMu       sync.Mutex
+	wsConns    map[*websocket.Conn]struct{}
 }
 
 type driveMsg struct {
@@ -49,8 +52,37 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+func (s *Server) CurrentROS() *ros.Client {
+	s.rosMu.RLock()
+	defer s.rosMu.RUnlock()
+	return s.ROS
+}
+
+func (s *Server) SetROS(client *ros.Client) {
+	s.rosMu.Lock()
+	old := s.ROS
+	s.ROS = client
+	s.rosMu.Unlock()
+
+	s.wsMu.Lock()
+	for conn := range s.wsConns {
+		_ = conn.Close()
+	}
+	s.wsMu.Unlock()
+
+	if old != nil && old != client {
+		old.Close()
+	}
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if s.ROS == nil {
+		s.ROS = ros.NewOfflineClient()
+	}
+	if s.wsConns == nil {
+		s.wsConns = make(map[*websocket.Conn]struct{})
+	}
 	if s.UI == nil {
 		s.UI = NewUIStore()
 	}
@@ -71,10 +103,11 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	width, height := s.ROS.Resolution()
-	batt := s.ROS.Battery()
-	night := s.ROS.Night()
-	nightMode, cameraLight := s.ROS.VideoMode()
+	client := s.CurrentROS()
+	width, height := client.Resolution()
+	batt := client.Battery()
+	night := client.Night()
+	nightMode, cameraLight := client.VideoMode()
 	modeLabel := map[int32]string{0: "color", 1: "ir", 2: "auto"}[nightMode]
 	nightOut := map[string]any{
 		"mode": nightMode, "modeLabel": modeLabel, "cameraLight": cameraLight,
@@ -91,15 +124,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ui := s.UI.Get()
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":         true,
+		"connected":  client.Connected(),
 		"battery":    batt,
 		"codec":      "h264+aac",
-		"frames":     s.ROS.FrameCount(),
-		"audio":      s.ROS.AudioCount(),
-		"frameAgeMs": s.ROS.FrameAgeMs(),
+		"frames":     client.FrameCount(),
+		"audio":      client.AudioCount(),
+		"frameAgeMs": client.FrameAgeMs(),
 		"width":      width,
 		"height":     height,
-		"tracked":    s.ROS.Tracked(),
-		"dock":       s.ROS.Dock(),
+		"tracked":    client.Tracked(),
+		"dock":       client.Dock(),
 		"night":      nightOut,
 		"wifi":       wifi,
 		"ui":         ui,
@@ -139,7 +173,7 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"logs": s.ROS.Logs()})
+	_ = json.NewEncoder(w).Encode(map[string]any{"logs": s.CurrentROS().Logs()})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -156,7 +190,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		s.ROS.SetTracked(m.Track == 1)
+		s.CurrentROS().SetTracked(m.Track == 1)
 		writeJSON(w, 200, map[string]any{
 			"ok": true, "track": m.Track == 1, "mecanum": m.Track == 0, "vio": m.VIO == 1, "motion": m,
 		})
@@ -177,8 +211,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		s.ROS.SetTracked(m.Track == 1)
-		_ = s.ROS.Stop()
+		client := s.CurrentROS()
+		client.SetTracked(m.Track == 1)
+		_ = client.Stop()
 		writeJSON(w, 200, map[string]any{
 			"ok": true, "track": m.Track == 1, "mecanum": m.Track == 0, "motion": m,
 			"note": "motor_node bounced to reload kinematics",
@@ -189,37 +224,40 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setNightMode(mode int32) error {
+	client := s.CurrentROS()
 	labels := map[int32]string{0: "color/day", 1: "IR on", 2: "IR auto"}
-	s.ROS.Log("info", "camera → "+labels[mode])
-	if err := s.ROS.SetNightMode(mode); err != nil {
+	client.Log("info", "camera → "+labels[mode])
+	if err := client.SetNightMode(mode); err != nil {
 		return err
 	}
-	s.ROS.RefreshNight()
+	client.RefreshNight()
 	return nil
 }
 
 func (s *Server) setCameraLight(level int32) error {
+	client := s.CurrentROS()
 	if level < 0 {
 		level = 0
 	}
 	if level > 100 {
 		level = 100
 	}
-	s.ROS.Log("info", fmt.Sprintf("IR light → %d", level))
-	if err := s.ROS.SetCameraLight(level); err != nil {
+	client.Log("info", fmt.Sprintf("IR light → %d", level))
+	if err := client.SetCameraLight(level); err != nil {
 		return err
 	}
-	s.ROS.RefreshNight()
+	client.RefreshNight()
 	return nil
 }
 
 func (s *Server) setVideoMode(mode, light int32) error {
+	client := s.CurrentROS()
 	labels := map[int32]string{0: "color/day", 1: "IR on", 2: "IR auto"}
-	s.ROS.Log("info", fmt.Sprintf("camera → %s, light=%d", labels[mode], light))
-	if err := s.ROS.SetVideoMode(mode, light); err != nil {
+	client.Log("info", fmt.Sprintf("camera → %s, light=%d", labels[mode], light))
+	if err := client.SetVideoMode(mode, light); err != nil {
 		return err
 	}
-	s.ROS.RefreshNight()
+	client.RefreshNight()
 	return nil
 }
 
@@ -243,10 +281,11 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		s.cameraMu.Lock()
 		defer s.cameraMu.Unlock()
 	}
+	client := s.CurrentROS()
 	var err error
 	switch body.Cmd {
 	case "stop":
-		err = s.ROS.ForceStop()
+		err = client.ForceStop()
 	case "ir_on":
 		err = s.setVideoMode(ros.NightModeIR, 80)
 	case "ir_off", "color":
@@ -260,19 +299,19 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "ir_light_off":
 		err = s.setCameraLight(0)
 	case "light_up":
-		_, light := s.ROS.VideoMode()
+		_, light := client.VideoMode()
 		err = s.setCameraLight(light + 10)
 	case "light_down":
-		_, light := s.ROS.VideoMode()
+		_, light := client.VideoMode()
 		err = s.setCameraLight(light - 10)
 	case "refresh_night":
-		s.ROS.RefreshNight()
+		client.RefreshNight()
 	default:
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "unknown cmd"})
 		return
 	}
 	if err != nil {
-		s.ROS.Log("error", body.Cmd+": "+err.Error())
+		client.Log("error", body.Cmd+": "+err.Error())
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
@@ -316,12 +355,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	s.wsMu.Lock()
+	s.wsConns[conn] = struct{}{}
+	s.wsMu.Unlock()
+	defer func() {
+		s.wsMu.Lock()
+		delete(s.wsConns, conn)
+		s.wsMu.Unlock()
+	}()
 
 	var pilotID uint64
 	if !viewOnly {
 		pilotID = s.pilotSeq.Add(1)
 	}
-	s.ROS.Log("info", map[bool]string{true: "view client connected", false: "pilot client connected"}[viewOnly])
+	client := s.CurrentROS()
+	client.Log("info", map[bool]string{true: "view client connected", false: "pilot client connected"}[viewOnly])
 
 	var writeMu sync.Mutex
 	var sendingVid atomic.Bool
@@ -345,16 +393,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Seed recent logs
-	for _, line := range s.ROS.Logs() {
+	for _, line := range client.Logs() {
 		writeJSON(map[string]any{"type": "log", "log": line})
 	}
 
-	unsubLog := s.ROS.OnLog(func(line ros.LogLine) {
+	unsubLog := client.OnLog(func(line ros.LogLine) {
 		writeJSON(map[string]any{"type": "log", "log": line})
 	})
 	defer unsubLog()
 
-	unsubVid := s.ROS.OnH264(func(pkt ros.VideoPacket) {
+	unsubVid := client.OnH264(func(pkt ros.VideoPacket) {
 		if !sendingVid.CompareAndSwap(false, true) {
 			return
 		}
@@ -367,7 +415,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			w, h := pkt.Width, pkt.Height
 			if w <= 0 || h <= 0 {
-				w, h = s.ROS.Resolution()
+				w, h = client.Resolution()
 			}
 			binary.BigEndian.PutUint16(buf[2:4], uint16(w))
 			binary.BigEndian.PutUint16(buf[4:6], uint16(h))
@@ -377,7 +425,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	})
 	defer unsubVid()
 
-	unsubAud := s.ROS.OnAAC(func(pkt ros.AudioPacket) {
+	unsubAud := client.OnAAC(func(pkt ros.AudioPacket) {
 		if !sendingAud.CompareAndSwap(false, true) {
 			return
 		}
@@ -395,7 +443,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		// Media-only socket — just keep alive until disconnect.
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
-				s.ROS.Log("info", "view client disconnected")
+				client.Log("info", "view client disconnected")
 				return
 			}
 		}
@@ -412,7 +460,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-stopDrive:
 				if s.releasePilot(pilotID) {
-					_ = s.ROS.Stop()
+					_ = client.Stop()
 				}
 				return
 			case <-t.C:
@@ -421,7 +469,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					time.Since(time.Unix(0, last)) > 400*time.Millisecond &&
 					driving.CompareAndSwap(true, false) {
 					if s.releasePilot(pilotID) {
-						_ = s.ROS.Stop()
+						_ = client.Stop()
 					}
 				}
 			}
@@ -432,9 +480,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if s.releasePilot(pilotID) {
-				_ = s.ROS.Stop()
+				_ = client.Stop()
 			}
-			s.ROS.Log("info", "pilot client disconnected")
+			client.Log("info", "pilot client disconnected")
 			return
 		}
 		var msg driveMsg
@@ -461,7 +509,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if x == 0 && y == 0 && az == 0 {
 			if driving.Swap(false) {
 				if s.releasePilot(pilotID) {
-					_ = s.ROS.Drive(0, 0, 0)
+					_ = client.Drive(0, 0, 0)
 				}
 			}
 			continue
@@ -471,6 +519,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		driving.Store(true)
 		lastDriveUnix.Store(time.Now().UnixNano())
-		_ = s.ROS.Drive(x, y, az)
+		_ = client.Drive(x, y, az)
 	}
 }
