@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scout Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0d10;
+      --panel: #12171c;
+      --line: #2a333c;
+      --text: #e7ecef;
+      --muted: #8b969f;
+      --accent: #3dd6c6;
+      --danger: #ff6b4a;
+      --warn: #e6b84d;
+      --ok: #5dca7a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    body {
+      background:
+        radial-gradient(700px 360px at 12% -8%, #1c2a2a 0%, transparent 55%),
+        radial-gradient(560px 300px at 100% 0%, #1a1f28 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+      font: 12px/1.35 "IBM Plex Mono", ui-monospace, monospace;
+    }
+    .wrap {
+      height: 100%;
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: 8px 10px;
+      display: grid;
+      gap: 8px;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+      min-height: 0;
+    }
+    h1 {
+      font-family: Syne, sans-serif; font-size: 1.15rem; font-weight: 700;
+      margin: 0; letter-spacing: 0.02em;
+    }
+    .meta { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; color: var(--muted); }
+    .pill { color: var(--muted); white-space: nowrap; }
+    .pill.on { color: var(--accent); }
+    .pill.bad { color: var(--danger); }
+    .pill.warn { color: var(--warn); }
+
+    .sig {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #0e1318; border: 1px solid var(--line); padding: 3px 8px 3px 6px;
+    }
+    .sig.bad { border-color: #6b3a2a; color: var(--danger); }
+    .sig.warn { border-color: #6b5a2a; color: var(--warn); }
+    .sig.ok { border-color: #2a5a4a; color: var(--accent); }
+    .sig-bars {
+      display: inline-flex; align-items: flex-end; gap: 2px; height: 14px;
+    }
+    .sig-bars i {
+      display: block; width: 3px; background: #3a424b; border-radius: 1px;
+    }
+    .sig-bars i:nth-child(1) { height: 4px; }
+    .sig-bars i:nth-child(2) { height: 7px; }
+    .sig-bars i:nth-child(3) { height: 10px; }
+    .sig-bars i:nth-child(4) { height: 14px; }
+    .sig[data-bars="1"] .sig-bars i:nth-child(-n+1),
+    .sig[data-bars="2"] .sig-bars i:nth-child(-n+2),
+    .sig[data-bars="3"] .sig-bars i:nth-child(-n+3),
+    .sig[data-bars="4"] .sig-bars i:nth-child(-n+4) { background: currentColor; }
+    .sig-txt { font-variant-numeric: tabular-nums; min-width: 4.5rem; }
+
+    .batt {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: #0e1318; border: 1px solid var(--line); padding: 3px 8px 3px 4px;
+    }
+    .batt-shell {
+      width: 52px; height: 18px; border: 2px solid #6a7580; position: relative; padding: 2px;
+    }
+    .batt-shell::after {
+      content: ""; position: absolute; right: -5px; top: 4px; width: 3px; height: 6px; background: #6a7580;
+    }
+    .batt-fill {
+      height: 100%; width: 0%; background: linear-gradient(90deg, #2f8f6b, var(--ok));
+      transition: width 0.35s ease, background 0.35s;
+    }
+    .batt-fill.low { background: linear-gradient(90deg, #8a2a1a, var(--danger)); }
+    .batt-fill.mid { background: linear-gradient(90deg, #8a6a1a, var(--warn)); }
+    .batt-fill.charge {
+      background: linear-gradient(90deg, #1a6a66, var(--accent));
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes pulse { 50% { filter: brightness(1.25); } }
+    .batt-txt { font-variant-numeric: tabular-nums; min-width: 5.5rem; color: var(--text); }
+
+    .stage-wrap {
+      position: relative; background: #000; border: 1px solid var(--line);
+      overflow: hidden; min-height: 0; height: 100%;
+    }
+    #view {
+      width: 100%; height: 100%; display: block; background: #000;
+      object-fit: contain;
+    }
+    .hud {
+      position: absolute; inset: 0; pointer-events: none;
+      display: flex; justify-content: space-between; align-items: flex-start;
+      padding: 8px 10px; font-size: 11px;
+    }
+    .hud-chip {
+      background: rgba(10,13,16,0.55); border: 1px solid rgba(61,214,198,0.25);
+      padding: 4px 8px; backdrop-filter: blur(4px); color: var(--accent);
+    }
+    .stage-tools {
+      position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; pointer-events: auto;
+    }
+
+    .dock {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr 1fr auto;
+      gap: 6px;
+      min-height: 0;
+    }
+    @media (max-width: 1100px) {
+      .dock { grid-template-columns: 1fr 1fr; }
+    }
+    .col {
+      background: var(--panel); border: 1px solid var(--line); padding: 7px 9px;
+      display: flex; flex-direction: column; gap: 5px; min-width: 0;
+    }
+    .col h2 {
+      margin: 0; font-size: 0.62rem; letter-spacing: 0.11em; text-transform: uppercase;
+      color: var(--muted); font-weight: 500;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+    .hint { color: var(--muted); font-size: 0.72rem; }
+    kbd {
+      background: #1a2026; border: 1px solid #3a424b; border-bottom-width: 2px;
+      padding: 0 4px; font-size: 0.85em;
+    }
+    button, .btn {
+      background: #1a2026; color: var(--text); border: 1px solid #3a424b;
+      padding: 5px 8px; cursor: pointer; font: inherit;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.danger { border-color: #6b3a2a; color: #ffb39a; }
+    button.active { border-color: var(--accent); color: var(--accent); background: #132222; }
+    input[type=range] { width: 90px; }
+    input[type=checkbox] { accent-color: var(--accent); }
+    a { color: var(--accent); }
+    a.btn {
+      background: #1a2026; color: var(--text); border: 1px solid #3a424b;
+      padding: 5px 8px; cursor: pointer; font: inherit; display: inline-block;
+      text-decoration: none;
+    }
+    a.btn:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+
+    .log-col { grid-column: 1 / -1; }
+    .log-panel {
+      background: #070a0c; border: 1px solid var(--line); height: 56px;
+      overflow: auto; padding: 4px 8px; font-size: 11px;
+    }
+    .log-panel.open { height: 140px; }
+    .log-line { white-space: pre-wrap; word-break: break-word; color: #9aa6af; }
+    .log-info { color: #9aa6af; }
+    .log-warn { color: var(--warn); }
+    .log-error { color: var(--danger); }
+    #secureHint { display: none; border: 1px solid #6b3a2a; color: #ffb39a; padding: 6px 8px; background: var(--panel); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>SCOUT</h1>
+      <div class="meta">
+        <span class="sig" id="sig" data-bars="0" title="Robot Wi‑Fi to AP">
+          <span class="sig-bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span class="sig-txt" id="sigTxt">wifi —</span>
+        </span>
+        <span id="linkState" class="pill">link: —</span>
+        <span id="wsState" class="pill bad">ws: down</span>
+        <span id="codecState" class="pill">media: wait</span>
+        <span id="audioState" class="pill">aac: —</span>
+        <span id="res">—</span>
+        <span class="batt" title="Battery">
+          <span class="batt-shell"><span id="battFill" class="batt-fill"></span></span>
+          <span id="batt" class="batt-txt">—</span>
+        </span>
+        <span id="driveMode" class="pill">base: —</span>
+        <span id="nightState" class="pill">night: —</span>
+      </div>
+    </header>
+
+    <div class="stage-wrap" id="stage">
+      <canvas id="view" width="1280" height="720"></canvas>
+      <div class="hud">
+        <div class="hud-chip" id="hudLeft">LIVE</div>
+        <div class="hud-chip" id="hudRight">CENTER LOCK</div>
+      </div>
+      <div class="stage-tools">
+        <button type="button" id="btnPop">Pop out</button>
+        <button type="button" id="btnMute">Mute</button>
+        <button type="button" id="btnSnap">Snap</button>
+      </div>
+    </div>
+
+    <div class="dock">
+      <div class="col">
+        <h2>Drive</h2>
+        <div class="row"><span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> <kbd>Q</kbd><kbd>E</kbd> <kbd>Z</kbd><kbd>C</kbd> <kbd>Space</kbd></span></div>
+        <div class="row">
+          <label>Spd <input id="spd" type="range" min="0.1" max="1" step="0.05" value="0.25" /></label>
+          <span id="spdLabel">0.25</span>
+          <button type="button" id="btnStop" class="danger">Stop</button>
+        </div>
+        <div class="hint" id="strafeHint">Strafe off while tracked</div>
+      </div>
+
+      <div class="col">
+        <h2>Camera / IR</h2>
+        <div class="row">
+          <button type="button" data-action="ir_on">IR On</button>
+          <button type="button" data-action="ir_off">Color</button>
+          <button type="button" data-action="ir_auto" title="Mechanical filter may click as ambient light changes">Auto (may click)</button>
+        </div>
+        <div class="row">
+          <button type="button" data-action="ir_light_on">IR Light On</button>
+          <button type="button" data-action="ir_light_off">IR Light Off</button>
+          <button type="button" data-action="light_up">IR +</button>
+          <button type="button" data-action="light_down">IR −</button>
+        </div>
+        <div class="hint" id="camHint">Color locks the filter; Auto may click · IR Light controls LEDs only</div>
+      </div>
+
+      <div class="col">
+        <h2>Display / Audio / Mission</h2>
+        <div class="row">
+          <label><input type="checkbox" id="chkReticle" checked /> Reticle</label>
+          <label><input type="checkbox" id="chkHud" checked /> HUD</label>
+          <label>Gain <input id="gain" type="range" min="1" max="12" step="0.5" value="6" /></label>
+          <span id="gainLabel">6×</span>
+        </div>
+        <div class="row">
+          <input id="mCallsign" placeholder="Callsign" style="width:7rem;background:#0e1318;border:1px solid #3a424b;color:var(--text);padding:4px 6px;font:inherit" />
+          <input id="mTitle" placeholder="Mission title" style="flex:1;min-width:8rem;background:#0e1318;border:1px solid #3a424b;color:var(--text);padding:4px 6px;font:inherit" />
+        </div>
+        <div class="row">
+          <input id="mObjective" placeholder="Objective" style="flex:1;min-width:10rem;background:#0e1318;border:1px solid #3a424b;color:var(--text);padding:4px 6px;font:inherit" />
+          <input id="mNotes" placeholder="Notes" style="flex:1;min-width:8rem;background:#0e1318;border:1px solid #3a424b;color:var(--text);padding:4px 6px;font:inherit" />
+          <button type="button" id="btnMission">Set</button>
+        </div>
+        <div class="row">
+          <a class="btn" href="/settings.html">Settings</a>
+          <a class="btn" href="/view.html" target="_blank" rel="noopener">Live view</a>
+        </div>
+      </div>
+
+      <div class="col log-col">
+        <div class="row" style="justify-content:space-between">
+          <h2>Event log</h2>
+          <div class="row">
+            <button type="button" id="btnToggleLog">Expand</button>
+            <button type="button" id="btnClearLog">Clear</button>
+          </div>
+        </div>
+        <div class="log-panel" id="log"></div>
+      </div>
+    </div>
+
+    <div id="secureHint">
+      WebCodecs needs a secure context. Open
+      <a id="localLink" href="http://127.0.0.1:8787/">http://127.0.0.1:8787/</a>
+    </div>
+  </div>
+
+  <script type="module">
+    import { createMediaPipeline, createLogger, setMissionInfo } from './media.js';
+
+    const canvas = document.getElementById('view');
+    const wsState = document.getElementById('wsState');
+    const codecState = document.getElementById('codecState');
+    const audioState = document.getElementById('audioState');
+    const linkState = document.getElementById('linkState');
+    const sig = document.getElementById('sig');
+    const sigTxt = document.getElementById('sigTxt');
+    const batt = document.getElementById('batt');
+    const battFill = document.getElementById('battFill');
+    const resEl = document.getElementById('res');
+    const spd = document.getElementById('spd');
+    const spdLabel = document.getElementById('spdLabel');
+    const driveMode = document.getElementById('driveMode');
+    const nightState = document.getElementById('nightState');
+    const strafeHint = document.getElementById('strafeHint');
+    const logEl = document.getElementById('log');
+    const hud = document.querySelector('.hud');
+    const gain = document.getElementById('gain');
+    const gainLabel = document.getElementById('gainLabel');
+
+    let tracked = true;
+    let muted = false;
+    let rttMs = null;
+    let lastVideoAt = 0;
+    const logger = createLogger(logEl);
+
+    const media = createMediaPipeline({
+      canvas,
+      reticle: true,
+      onStatus(text, ok) {
+        codecState.textContent = text;
+        codecState.className = 'pill' + (ok ? ' on' : (text.includes('err') ? ' bad' : ''));
+      },
+    });
+    media.setGain(6);
+
+    if (!('VideoDecoder' in window)) {
+      const hint = document.getElementById('secureHint');
+      const link = document.getElementById('localLink');
+      const port = location.port || '8787';
+      link.href = `http://127.0.0.1:${port}/`;
+      link.textContent = `http://127.0.0.1:${port}/`;
+      hint.style.display = 'block';
+    }
+
+    const keys = {};
+    const isTyping = (e) => ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName);
+    const clearDriveKeys = () => {
+      Object.keys(keys).forEach(k => { keys[k] = false; });
+    };
+    const setKey = (e, down) => {
+      if (isTyping(e)) return;
+      const k = e.key.toLowerCase();
+      if (['w','a','s','d','q','e','z','c',' '].includes(k)) {
+        e.preventDefault();
+        keys[k] = down;
+      }
+    };
+    window.addEventListener('keydown', e => {
+      if (isTyping(e)) return;
+      if (e.key === ' ') {
+        e.preventDefault();
+        if (!e.repeat) {
+          clearDriveKeys();
+          doAction('stop');
+        }
+        return;
+      }
+      setKey(e, true);
+    });
+    window.addEventListener('keyup', e => setKey(e, false));
+    window.addEventListener('blur', clearDriveKeys);
+    spd.addEventListener('input', () => { spdLabel.textContent = spd.value; });
+    if (gain) {
+      gain.addEventListener('input', () => {
+        gainLabel.textContent = gain.value + '×';
+        media.setGain(parseFloat(gain.value));
+      });
+    }
+
+    function pushUI(partial) {
+      fetch('/api/ui', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(partial),
+      }).catch(() => {});
+    }
+    document.getElementById('chkReticle').addEventListener('change', e => {
+      media.setReticle(e.target.checked);
+      pushUI({ reticle: e.target.checked });
+    });
+    document.getElementById('chkHud').addEventListener('change', e => {
+      hud.style.display = e.target.checked ? 'flex' : 'none';
+      pushUI({ hud: e.target.checked });
+    });
+    function applyMissionFromForm() {
+      const mission = {
+        callsign: document.getElementById('mCallsign').value.trim(),
+        title: document.getElementById('mTitle').value.trim(),
+        objective: document.getElementById('mObjective').value.trim(),
+        notes: document.getElementById('mNotes').value.trim(),
+      };
+      setMissionInfo(mission);
+      pushUI({ mission });
+      logger.push('info', 'mission updated');
+    }
+    document.getElementById('btnMission').addEventListener('click', applyMissionFromForm);
+    ['mCallsign', 'mTitle', 'mObjective', 'mNotes'].forEach(id => {
+      document.getElementById(id).addEventListener('keydown', e => {
+        if (e.key === 'Enter') applyMissionFromForm();
+      });
+    });
+    document.getElementById('btnMute').addEventListener('click', async () => {
+      muted = !muted;
+      media.setMuted(muted);
+      document.getElementById('btnMute').textContent = muted ? 'Unmute' : 'Mute';
+      audioState.textContent = muted ? 'aac: muted' : 'aac: on';
+      audioState.className = 'pill' + (muted ? '' : ' on');
+      if (!muted) await media.unlockAudio();
+      logger.push('info', muted ? 'audio muted' : 'audio unmuted');
+    });
+    document.getElementById('btnPop').addEventListener('click', () => {
+      const w = window.open('/view.html', '_blank');
+      if (!w) location.href = '/view.html';
+      else logger.push('info', 'opened view tab');
+    });
+    document.getElementById('btnSnap').addEventListener('click', async () => {
+      const blob = await media.snapshotBlob();
+      if (!blob) { logger.push('error', 'snapshot failed'); return; }
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `scout-${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      logger.push('info', 'snapshot saved');
+    });
+    document.getElementById('btnClearLog').addEventListener('click', () => logger.clear());
+    document.getElementById('btnToggleLog').addEventListener('click', (e) => {
+      const open = logEl.classList.toggle('open');
+      e.target.textContent = open ? 'Collapse' : 'Expand';
+    });
+    window.addEventListener('pointerdown', () => media.unlockAudio(), { once: true });
+
+    function setDriveUI(isTracked) {
+      tracked = !!isTracked;
+      driveMode.textContent = tracked ? 'base: tracked' : 'base: mecanum';
+      driveMode.className = 'pill on';
+      strafeHint.textContent = tracked ? 'Strafe (Z/C) off while tracked' : 'Strafe (Z/C) enabled';
+    }
+
+    function renderBattery(b) {
+      if (!b || b.percent == null) {
+        batt.textContent = '—';
+        battFill.style.width = '0%';
+        return;
+      }
+      const pct = Math.max(0, Math.min(100, Number(b.percent)));
+      const label = b.label || '';
+      batt.textContent = `${pct}%  ${label}`;
+      battFill.style.width = pct + '%';
+      battFill.className = 'batt-fill' +
+        (label === 'charging' || label === 'full' ? ' charge' : pct <= 20 ? ' low' : pct <= 40 ? ' mid' : '');
+      document.getElementById('hudRight').textContent = `${pct}% · ${label || 'batt'}`;
+    }
+
+    function renderWifi(w) {
+      if (!w || !w.ok) {
+        sig.dataset.bars = '0';
+        sig.className = 'sig';
+        sigTxt.textContent = 'wifi —';
+        sig.title = w && w.error ? w.error : 'Wi‑Fi unavailable';
+        return;
+      }
+      const bars = Math.max(0, Math.min(4, w.bars|0));
+      sig.dataset.bars = String(bars);
+      sig.className = 'sig' + (bars <= 1 ? ' bad' : bars === 2 ? ' warn' : ' ok');
+      sigTxt.textContent = `${w.rssi} dBm`;
+      sig.title = `Robot Wi‑Fi${w.ssid ? ' · ' + w.ssid : ''} · ${w.quality}% · ${bars}/4 bars` +
+        (bars <= 1 ? ' — getting far / weak AP signal' : '');
+    }
+
+    function renderLink(frameAgeMs) {
+      const age = lastVideoAt ? (Date.now() - lastVideoAt) : (frameAgeMs >= 0 ? frameAgeMs : null);
+      const parts = [];
+      if (rttMs != null) parts.push(`${rttMs|0}ms`);
+      if (age != null) parts.push(`vid ${age|0}ms`);
+      linkState.textContent = parts.length ? `link: ${parts.join(' · ')}` : 'link: —';
+      let cls = 'pill on';
+      if (rttMs != null && rttMs > 180) cls = 'pill warn';
+      if (rttMs != null && rttMs > 350) cls = 'pill bad';
+      if (age != null && age > 500) cls = 'pill warn';
+      if (age != null && age > 1200) cls = 'pill bad';
+      if (wsState.classList.contains('bad')) cls = 'pill bad';
+      linkState.className = cls;
+    }
+
+    async function doAction(cmd) {
+      // Actions use one HTTP API request. Drive remains on the low-latency socket.
+      // Previously this sent both WS + HTTP, causing every IR command (and click)
+      // to execute twice.
+      try {
+        const r = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cmd }),
+        });
+        const j = await r.json();
+        if (!r.ok || j.ok === false) logger.push('error', j.error || `${cmd} failed`);
+      } catch (e) {
+        logger.push('error', `${cmd}: ${e.message}`);
+      }
+    }
+    document.getElementById('btnStop').addEventListener('click', () => {
+      clearDriveKeys();
+      doAction('stop');
+    });
+    document.querySelectorAll('[data-action]').forEach(btn => {
+      btn.addEventListener('click', () => doAction(btn.dataset.action));
+    });
+
+    let ws;
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => {
+        wsState.textContent = 'ws: up';
+        wsState.className = 'pill on';
+        logger.push('info', 'websocket connected');
+      };
+      ws.onclose = () => {
+        wsState.textContent = 'ws: down';
+        wsState.className = 'pill bad';
+        rttMs = null;
+        media.resetKey();
+        setTimeout(connect, 1000);
+      };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          try {
+            const j = JSON.parse(ev.data);
+            if (j.type === 'pong' && j.t) {
+              rttMs = Math.max(0, Date.now() - j.t);
+              renderLink(-1);
+            }
+            if (j.type === 'log' && j.log) logger.push(j.log.level || 'info', j.log.msg, j.log.ts);
+          } catch (_) {}
+          return;
+        }
+        const u8 = new Uint8Array(ev.data);
+        if (u8[0] === 1) lastVideoAt = Date.now();
+        if (u8[0] === 2) {
+          audioState.textContent = muted ? 'aac: muted' : 'aac: live';
+          audioState.className = 'pill' + (muted ? '' : ' on');
+        }
+        media.onPacket(ev.data);
+      };
+    }
+    connect();
+    doAction('refresh_night');
+
+    setInterval(() => {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      }
+    }, 1500);
+
+    setInterval(() => {
+      fetch('/api/health').then(r => r.json()).then(j => {
+        if (j.battery) renderBattery(j.battery);
+        if (j.wifi) renderWifi(j.wifi);
+        renderLink(typeof j.frameAgeMs === 'number' ? j.frameAgeMs : -1);
+        if (j.width && j.height) {
+          resEl.textContent = `${j.width}x${j.height}`;
+          const rssi = j.wifi && j.wifi.ok ? `${j.wifi.rssi}dBm` : 'wifi?';
+          document.getElementById('hudLeft').textContent = `${j.width}×${j.height} · ${rssi}`;
+        }
+        if (typeof j.tracked === 'boolean') setDriveUI(j.tracked);
+        if (j.night) {
+          const mode = j.night.modeLabel || (j.night.isNight ? 'ir' : 'color');
+          const br = j.night.brightness != null ? j.night.brightness : '—';
+          const cl = j.night.cameraLight != null ? j.night.cameraLight : '—';
+          nightState.textContent = `${mode} · LED ${cl} · ${br}`;
+          nightState.className = 'pill' + (j.night.isNight || mode === 'ir' ? ' on' : '');
+          const hint = document.getElementById('camHint');
+          if (hint) {
+            hint.textContent = mode === 'color'
+              ? 'Color mode (IR-cut in) · use IR On for night vision'
+              : `Night mode · illuminator ${cl}/100 · sensor bright ${br}`;
+          }
+        }
+        if (j.ui) {
+          if (typeof j.ui.reticle === 'boolean') {
+            document.getElementById('chkReticle').checked = j.ui.reticle;
+            media.setReticle(j.ui.reticle);
+          }
+          if (typeof j.ui.hud === 'boolean') {
+            document.getElementById('chkHud').checked = j.ui.hud;
+            hud.style.display = j.ui.hud ? 'flex' : 'none';
+          }
+          if (j.ui.mission) {
+            setMissionInfo(j.ui.mission);
+            const m = j.ui.mission;
+            const editing = ['mCallsign', 'mTitle', 'mObjective', 'mNotes'].includes(document.activeElement && document.activeElement.id);
+            if (!editing) {
+              document.getElementById('mCallsign').value = m.callsign || '';
+              document.getElementById('mTitle').value = m.title || '';
+              document.getElementById('mObjective').value = m.objective || '';
+              document.getElementById('mNotes').value = m.notes || '';
+            }
+          }
+        }
+      }).catch(() => {});
+    }, 1200);
+
+    setInterval(() => {
+      if (!ws || ws.readyState !== 1) return;
+      let y = 0, az = 0, x = 0;
+      if (keys.w) y += 1;
+      if (keys.s) y -= 1;
+      if (keys.a) az -= 1;
+      if (keys.d) az += 1;
+      if (!tracked) {
+        if (keys.q || keys.z) x -= 1;
+        if (keys.e || keys.c) x += 1;
+      } else {
+        if (keys.q) az -= 1;
+        if (keys.e) az += 1;
+      }
+      if (x || y || az) {
+        ws.send(JSON.stringify({ x, y, az, spd: parseFloat(spd.value) }));
+        keys._wasMoving = true;
+      } else if (keys._wasMoving) {
+        keys._wasMoving = false;
+        ws.send(JSON.stringify({ x: 0, y: 0, az: 0, spd: parseFloat(spd.value) }));
+      }
+    }, 50);
+  </script>
+</body>
+</html>

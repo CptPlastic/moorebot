@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scout Live</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&display=swap" rel="stylesheet" />
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #3dd6c6; font: 12px/1.3 "IBM Plex Mono", monospace; overflow: hidden; }
+    .stage { position: relative; width: 100%; height: 100%; background: #000; }
+    #view { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+    .chrome {
+      position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: 10px; align-items: center;
+      padding: 10px 14px; background: linear-gradient(transparent, rgba(0,0,0,0.72));
+      opacity: 0; transition: opacity 0.2s;
+    }
+    .stage:hover .chrome, .chrome:focus-within { opacity: 1; }
+    button {
+      background: rgba(20,24,28,0.9); color: #e7ecef; border: 1px solid #3a424b;
+      padding: 7px 11px; cursor: pointer; font: inherit;
+    }
+    .pill { opacity: 0.9; }
+    .pill.on { color: #3dd6c6; }
+    .pill.bad { color: #ff6b4a; }
+    .hint { margin-left: auto; opacity: 0.55; }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <canvas id="view" width="1280" height="720"></canvas>
+    <div class="chrome">
+      <span id="status" class="pill">connecting…</span>
+      <span id="night" class="pill">cam: —</span>
+      <button type="button" id="btnMute">Mute</button>
+      <button type="button" id="btnFs">Fullscreen</button>
+      <span class="hint">Live view · drive on control</span>
+    </div>
+  </div>
+  <script type="module">
+    import { createMediaPipeline, setMissionInfo } from './media.js';
+    const canvas = document.getElementById('view');
+    const status = document.getElementById('status');
+    const nightEl = document.getElementById('night');
+    let muted = false;
+    const media = createMediaPipeline({
+      canvas,
+      reticle: true,
+      onStatus(text, ok) {
+        status.textContent = text;
+        status.className = 'pill' + (ok ? ' on' : '');
+      },
+    });
+    media.setGain(6);
+
+    document.getElementById('btnMute').addEventListener('click', async () => {
+      muted = !muted;
+      media.setMuted(muted);
+      document.getElementById('btnMute').textContent = muted ? 'Unmute' : 'Mute';
+      if (!muted) await media.unlockAudio();
+    });
+    document.getElementById('btnFs').addEventListener('click', () => {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+      else document.exitFullscreen().catch(() => {});
+    });
+    window.addEventListener('pointerdown', () => media.unlockAudio(), { once: true });
+
+    function applyUI(ui) {
+      if (!ui) return;
+      if (typeof ui.reticle === 'boolean') media.setReticle(ui.reticle);
+      if (ui.mission) setMissionInfo(ui.mission);
+    }
+
+    setInterval(() => {
+      fetch('/api/health').then(r => r.json()).then(j => {
+        if (j.ui) applyUI(j.ui);
+        if (j.night) {
+          const mode = j.night.modeLabel || (j.night.isNight ? 'ir' : 'color');
+          const light = j.night.cameraLight != null ? ` · IR ${j.night.cameraLight}` : '';
+          nightEl.textContent = `cam: ${mode}${light}`;
+          nightEl.className = 'pill' + (j.night.isNight ? ' on' : '');
+        }
+      }).catch(() => {});
+    }, 1000);
+
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws?view=1`);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => { status.textContent = 'live'; status.className = 'pill on'; };
+      ws.onclose = () => { status.textContent = 'reconnecting…'; media.resetKey(); setTimeout(connect, 1000); };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') return;
+        media.onPacket(ev.data);
+      };
+    }
+    connect();
+    fetch('/api/ui').then(r => r.json()).then(j => applyUI(j.ui)).catch(() => {});
+  </script>
+</body>
+</html>

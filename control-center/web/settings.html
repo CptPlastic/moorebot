@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scout Settings</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0d10; --panel: #12171c; --line: #2a333c; --text: #e7ecef;
+      --muted: #8b969f; --accent: #3dd6c6; --danger: #ff6b4a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; color: var(--text);
+      font: 14px/1.45 "IBM Plex Mono", ui-monospace, monospace;
+      background: radial-gradient(800px 400px at 10% -10%, #1c2a2a 0%, transparent 55%), var(--bg);
+    }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 24px; display: grid; gap: 16px; }
+    header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    h1 { font-family: Syne, sans-serif; margin: 0; font-size: 1.5rem; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line); padding: 16px 18px;
+      display: grid; gap: 12px;
+    }
+    h2 {
+      margin: 0; font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--muted); font-weight: 500;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .hint { color: var(--muted); font-size: 0.85rem; }
+    button {
+      background: #1a2026; color: var(--text); border: 1px solid #3a424b;
+      padding: 10px 14px; cursor: pointer; font: inherit;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.active { border-color: var(--accent); color: var(--accent); background: #132222; }
+    #msg { min-height: 1.2em; }
+    #msg.err { color: var(--danger); }
+    #msg.ok { color: var(--accent); }
+    code { background: #0e1318; padding: 1px 5px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Settings</h1>
+      <a href="/">← Control</a>
+    </header>
+
+    <div class="card">
+      <h2>Drive base</h2>
+      <p class="hint">Must match the hardware on the bot. Changing this writes <code>/var/roller_eye/config/motion</code> and restarts <code>motor_node</code>.</p>
+      <div class="row">
+        <button type="button" id="btnTracked">Tracked</button>
+        <button type="button" id="btnMecanum">Mecanum</button>
+      </div>
+      <div class="hint" id="current">Current: —</div>
+      <div id="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>About</h2>
+      <div class="hint">VIO stays off for piloting (too heavy on Scout). Night/IR lights and snapshots live on the main control screen.</div>
+    </div>
+  </div>
+
+  <script>
+    const btnTracked = document.getElementById('btnTracked');
+    const btnMecanum = document.getElementById('btnMecanum');
+    const current = document.getElementById('current');
+    const msg = document.getElementById('msg');
+
+    function setUI(tracked) {
+      btnTracked.classList.toggle('active', tracked);
+      btnMecanum.classList.toggle('active', !tracked);
+      current.textContent = tracked ? 'Current: tracked' : 'Current: mecanum';
+    }
+
+    async function load() {
+      msg.textContent = '';
+      msg.className = '';
+      try {
+        const r = await fetch('/api/settings');
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || r.statusText);
+        setUI(!!j.track);
+      } catch (e) {
+        msg.className = 'err';
+        msg.textContent = 'Failed to load: ' + e.message;
+      }
+    }
+
+    async function setTrack(want) {
+      msg.className = '';
+      msg.textContent = 'Updating…';
+      try {
+        const r = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ track: want }),
+        });
+        const text = await r.text();
+        let j;
+        try { j = JSON.parse(text); } catch (_) {
+          throw new Error(text.slice(0, 200) || r.statusText);
+        }
+        if (!r.ok || j.ok === false) throw new Error(j.error || r.statusText);
+        setUI(!!j.track);
+        msg.className = 'ok';
+        msg.textContent = j.note || 'Saved';
+      } catch (e) {
+        msg.className = 'err';
+        msg.textContent = 'Failed: ' + e.message;
+      }
+    }
+
+    btnTracked.addEventListener('click', () => setTrack(true));
+    btnMecanum.addEventListener('click', () => setTrack(false));
+    load();
+  </script>
+</body>
+</html>
