@@ -97,6 +97,14 @@
     @keyframes pulse { 50% { filter: brightness(1.25); } }
     .batt-txt { font-variant-numeric: tabular-nums; min-width: 5.5rem; color: var(--text); }
 
+    .batt-warn {
+      background: linear-gradient(90deg, #4a1208, #7a2010, #4a1208);
+      color: #ffd9cf; border: 1px solid var(--danger);
+      text-align: center; font-weight: 700; letter-spacing: 0.08em;
+      padding: 6px 10px; margin: 6px 0 0;
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
     .stage-wrap {
       position: relative; background: #000; border: 1px solid var(--line);
       overflow: hidden; min-height: 0; height: 100%;
@@ -117,6 +125,11 @@
     .stage-tools {
       position: absolute; right: 8px; bottom: 8px; display: flex; gap: 6px; pointer-events: auto;
     }
+    .hud-instruments {
+      position: absolute; left: 10px; bottom: 8px; pointer-events: none;
+      font-size: 11px; letter-spacing: 0.06em; font-variant-numeric: tabular-nums;
+    }
+    .hud-instruments .warn-rng { color: var(--warn); }
 
     .dock {
       display: grid;
@@ -191,8 +204,12 @@
         </span>
         <span id="driveMode" class="pill">base: —</span>
         <span id="nightState" class="pill">night: —</span>
+        <span id="tempState" class="pill" title="Scout SoC temperature">temp: —</span>
+        <span id="buildVer" class="pill" title="Control center build">build: —</span>
       </div>
     </header>
+
+    <div id="battWarn" class="batt-warn" hidden>LOW BATTERY — robot may power off; return it to the charger</div>
 
     <div class="stage-wrap" id="stage">
       <canvas id="view" width="1280" height="720"></canvas>
@@ -200,6 +217,7 @@
         <div class="hud-chip" id="hudLeft">LIVE</div>
         <div class="hud-chip" id="hudRight">CENTER LOCK</div>
       </div>
+      <div class="hud-chip hud-instruments" id="hudInstruments" hidden></div>
       <div class="stage-tools">
         <button type="button" id="btnPop">Pop out</button>
         <button type="button" id="btnMute">Mute</button>
@@ -233,6 +251,14 @@
           <button type="button" data-action="light_down">IR −</button>
         </div>
         <div class="hint" id="camHint">Color locks the filter; Auto may click · IR Light controls LEDs only</div>
+        <h2 style="margin-top:10px">Video Quality</h2>
+        <div class="row">
+          <button type="button" data-quality="quality_high">High 1080p</button>
+          <button type="button" data-quality="quality_medium">Med 720p</button>
+          <button type="button" data-quality="quality_low">Low 480p</button>
+          <label class="pill" style="cursor:pointer"><input type="checkbox" id="chkAutoQ" checked> Auto</label>
+        </div>
+        <div class="hint" id="qHint">Lower quality = smoother on weak Wi-Fi · Auto adapts to signal</div>
       </div>
 
       <div class="col">
@@ -391,14 +417,20 @@
         if (e.key === 'Enter') applyMissionFromForm();
       });
     });
+    // Tell the server whether to stream audio at all — muting stops the AAC
+    // bytes over the wire, not just playback, to save bandwidth.
+    function sendAudioState() {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'audio', on: !muted }));
+    }
     document.getElementById('btnMute').addEventListener('click', async () => {
       muted = !muted;
       media.setMuted(muted);
       document.getElementById('btnMute').textContent = muted ? 'Unmute' : 'Mute';
       audioState.textContent = muted ? 'aac: muted' : 'aac: on';
       audioState.className = 'pill' + (muted ? '' : ' on');
+      sendAudioState();
       if (!muted) await media.unlockAudio();
-      logger.push('info', muted ? 'audio muted' : 'audio unmuted');
+      logger.push('info', muted ? 'audio muted (stream stopped)' : 'audio unmuted');
     });
     document.getElementById('btnPop').addEventListener('click', () => {
       const w = window.open('/view.html', '_blank');
@@ -429,19 +461,57 @@
       strafeHint.textContent = tracked ? 'Strafe (Z/C) off while tracked' : 'Strafe (Z/C) enabled';
     }
 
+    const battWarn = document.getElementById('battWarn');
     function renderBattery(b) {
       if (!b || b.percent == null) {
         batt.textContent = '—';
         battFill.style.width = '0%';
+        battWarn.hidden = true;
         return;
       }
       const pct = Math.max(0, Math.min(100, Number(b.percent)));
       const label = b.label || '';
       batt.textContent = `${pct}%  ${label}`;
+      batt.parentElement.title = 'Battery' +
+        (b.voltageMV ? ` · ${(b.voltageMV / 1000).toFixed(2)}V` : '') +
+        (b.source ? ` · ${b.source === 'kernel' ? 'fuel gauge' : 'ROS estimate'}` : '');
       battFill.style.width = pct + '%';
       battFill.className = 'batt-fill' +
         (label === 'charging' || label === 'full' ? ' charge' : pct <= 20 ? ' low' : pct <= 40 ? ' mid' : '');
       document.getElementById('hudRight').textContent = `${pct}% · ${label || 'batt'}`;
+      // BMS hard-cuts power under load well before 0%; warn early.
+      battWarn.hidden = !(pct <= 25 && label !== 'charging' && label !== 'full');
+    }
+
+    function renderTemp(t) {
+      const el = document.getElementById('tempState');
+      if (!t) { el.textContent = 'temp: —'; el.className = 'pill'; return; }
+      const f = Math.round(t * 9 / 5 + 32);
+      el.textContent = `temp: ${f}\u00B0F`;
+      // Thresholds are the chip's comfort limits: 75°C/85°C.
+      el.className = 'pill' + (t >= 85 ? ' bad' : t >= 75 ? ' on' : '');
+    }
+
+    const hudInstruments = document.getElementById('hudInstruments');
+    function renderInstruments(s) {
+      if (!s || (!s.tofOk && !s.imuOk && !s.odomOk)) { hudInstruments.hidden = true; return; }
+      const parts = [];
+      if (s.imuOk) {
+        const f = (v) => (v >= 0 ? '+' : '\u2212') + String(Math.round(Math.abs(v))).padStart(2, '0') + '\u00B0';
+        parts.push(`TILT P${f(s.pitchDeg)} R${f(s.rollDeg)}`);
+      }
+      if (s.tofOk) {
+        parts.push(s.tofM >= 0
+          ? `RNG ${s.tofM.toFixed(2)}m` + (s.tofM < 0.3 ? ' \u26A0' : '')
+          : 'RNG ---');
+      }
+      if (s.odomOk) {
+        parts.push(`SPD ${s.speedMS.toFixed(2)}m/s`);
+        parts.push(`TRIP ${s.tripM >= 100 ? s.tripM.toFixed(0) : s.tripM.toFixed(1)}m`);
+      }
+      hudInstruments.textContent = parts.join('  \u00B7  ');
+      hudInstruments.classList.toggle('warn-rng', s.tofOk && s.tofM >= 0 && s.tofM < 0.3);
+      hudInstruments.hidden = false;
     }
 
     function renderWifi(w) {
@@ -499,6 +569,44 @@
       btn.addEventListener('click', () => doAction(btn.dataset.action));
     });
 
+    // Video quality: manual presets + optional auto-adapt on link quality.
+    const qLevels = ['quality_low', 'quality_medium', 'quality_high'];
+    // Default to auto-adapt on, starting at 720p (matches the server's default
+    // encode on connect). Keeps load off the Scout unless the link is strong.
+    let autoQuality = true;
+    let currentQ = 'quality_medium';
+    let pendingQ = null, pendingCount = 0;
+    function setQuality(cmd) {
+      if (cmd === currentQ) return;
+      currentQ = cmd;
+      doAction(cmd);
+    }
+    document.querySelectorAll('[data-quality]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        autoQuality = false;
+        document.getElementById('chkAutoQ').checked = false;
+        setQuality(btn.dataset.quality);
+      });
+    });
+    document.getElementById('chkAutoQ').addEventListener('change', (e) => {
+      autoQuality = e.target.checked;
+      pendingQ = null; pendingCount = 0;
+    });
+    // Called from the health poll; steps quality with hysteresis so it can't flap.
+    function autoAdaptQuality(rssi, frameAgeMs) {
+      if (!autoQuality) return;
+      const weak = (rssi <= -75) || (frameAgeMs > 500);
+      const strong = (rssi >= -62) && (frameAgeMs >= 0 && frameAgeMs < 150);
+      const idx = qLevels.indexOf(currentQ);
+      let target = currentQ;
+      if (weak && idx > 0) target = qLevels[idx - 1];
+      else if (strong && idx < qLevels.length - 1) target = qLevels[idx + 1];
+      if (target === currentQ) { pendingQ = null; pendingCount = 0; return; }
+      if (target === pendingQ) pendingCount++;
+      else { pendingQ = target; pendingCount = 1; }
+      if (pendingCount >= 2) { setQuality(target); pendingQ = null; pendingCount = 0; }
+    }
+
     let ws;
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -508,6 +616,7 @@
         wsState.textContent = 'ws: up';
         wsState.className = 'pill on';
         logger.push('info', 'websocket connected');
+        sendAudioState();
       };
       ws.onclose = () => {
         wsState.textContent = 'ws: down';
@@ -550,7 +659,13 @@
       fetch('/api/health').then(r => r.json()).then(j => {
         if (j.battery) renderBattery(j.battery);
         if (j.wifi) renderWifi(j.wifi);
+        if (j.version) document.getElementById('buildVer').textContent = 'build: ' + j.version;
+        renderTemp(j.tempC);
+        renderInstruments(j.connected ? j.sensors : null);
         renderLink(typeof j.frameAgeMs === 'number' ? j.frameAgeMs : -1);
+        if (j.connected && j.wifi && j.wifi.ok) {
+          autoAdaptQuality(j.wifi.rssi, typeof j.frameAgeMs === 'number' ? j.frameAgeMs : -1);
+        }
         if (j.width && j.height) {
           resEl.textContent = `${j.width}x${j.height}`;
           const rssi = j.wifi && j.wifi.ok ? `${j.wifi.rssi}dBm` : 'wifi?';

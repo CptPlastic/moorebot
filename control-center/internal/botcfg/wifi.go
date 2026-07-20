@@ -153,11 +153,16 @@ func rssiToBars(rssi int) int {
 }
 
 // WifiCache polls the robot on a timer so /api/health stays fast.
+// It samples the kernel battery gauge in the same cycle (one extra SSH exec
+// per interval — negligible load, and far more truthful than the ROS topic).
 type WifiCache struct {
-	c    Client
-	mu   sync.RWMutex
-	last Wifi
-	at   time.Time
+	c      Client
+	mu     sync.RWMutex
+	last   Wifi
+	at     time.Time
+	batt   Battery
+	battAt time.Time
+	tempC  int
 }
 
 func NewWifiCache(c Client) *WifiCache {
@@ -179,11 +184,25 @@ func (w *WifiCache) Start(every time.Duration) {
 }
 
 func (w *WifiCache) refresh() {
-	got := w.c.ReadWifi()
+	// Preferred path: one HTTP GET to the on-robot telemetry daemon.
+	// SSH (a full session per sample) is only a fallback for robots that
+	// don't have the daemon installed yet.
+	got, batt, tempC, err := w.c.ReadTelemetry()
+	if err != nil {
+		got = w.c.ReadWifi()
+		batt = w.c.ReadBattery()
+	}
 	got.AgeMs = 0
 	w.mu.Lock()
 	w.last = got
 	w.at = time.Now()
+	if batt.OK {
+		w.batt = batt
+		w.battAt = time.Now()
+	}
+	if tempC > 0 {
+		w.tempC = tempC
+	}
 	w.mu.Unlock()
 }
 
@@ -195,4 +214,23 @@ func (w *WifiCache) Get() Wifi {
 		out.AgeMs = time.Since(w.at).Milliseconds()
 	}
 	return out
+}
+
+// GetTempC returns the hottest SoC temperature seen on the last poll (°C),
+// or 0 when unknown.
+func (w *WifiCache) GetTempC() int {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.tempC
+}
+
+// GetBattery returns the last good kernel battery reading and its age.
+// Stale readings (Scout unreachable) are discarded after two minutes.
+func (w *WifiCache) GetBattery() (Battery, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if !w.batt.OK || w.battAt.IsZero() || time.Since(w.battAt) > 2*time.Minute {
+		return Battery{}, false
+	}
+	return w.batt, true
 }

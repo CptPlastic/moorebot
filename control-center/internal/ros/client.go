@@ -2,12 +2,15 @@ package ros
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/goroslib/v2"
 	"github.com/bluenviron/goroslib/v2/pkg/msgs/geometry_msgs"
+	"github.com/bluenviron/goroslib/v2/pkg/msgs/nav_msgs"
+	"github.com/bluenviron/goroslib/v2/pkg/msgs/sensor_msgs"
 	"github.com/bluenviron/goroslib/v2/pkg/msgs/std_msgs"
 )
 
@@ -34,6 +37,20 @@ type BatteryInfo struct {
 	State   int     `json:"state"`
 	Label   string  `json:"label"`
 	Raw     []int32 `json:"raw,omitempty"`
+}
+
+// SensorState is the latest ToF/IMU/odometry snapshot for the HUD.
+// All values are cheap passive reads: the Scout publishes these streams
+// continuously whether or not anyone subscribes.
+type SensorState struct {
+	TofM     float64 `json:"tofM"` // meters; -1 when out of range/invalid
+	PitchDeg float64 `json:"pitchDeg"`
+	RollDeg  float64 `json:"rollDeg"`
+	SpeedMS  float64 `json:"speedMS"`
+	TripM    float64 `json:"tripM"`
+	TofOK    bool    `json:"tofOk"`
+	IMUOK    bool    `json:"imuOk"`
+	OdomOK   bool    `json:"odomOk"`
 }
 
 // LogLine is a control-center event for the UI console.
@@ -63,6 +80,7 @@ type Client struct {
 	lastFrameUnix int64 // unix nanos
 	nightErr      atomic.Bool
 	tracked       bool
+	swapLR        bool
 	autonomy      bool
 	dockSession   bool
 	wasDriving    bool
@@ -77,6 +95,11 @@ type Client struct {
 	logID   uint64
 
 	backupSub *goroslib.Subscriber
+
+	sensors  SensorState
+	odomX    float64
+	odomY    float64
+	odomInit bool
 }
 
 type Config struct {
@@ -312,8 +335,107 @@ func Connect(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("video parameter subscriber: %w", err)
 	}
 
+	c.subscribeSensors(n)
+
 	c.Log("info", "ROS bridge connected")
 	return c, nil
+}
+
+// subscribeSensors taps the Scout's always-on instrument streams (ToF
+// rangefinder, IMU, wheel odometry). Failures are logged, not fatal: the
+// HUD simply shows no data for that instrument.
+func (c *Client) subscribeSensors(n *goroslib.Node) {
+	_, err := goroslib.NewSubscriber(goroslib.SubscriberConf{
+		Node:      n,
+		Topic:     "/SensorNode/tof",
+		QueueSize: 1,
+		Callback: func(msg *sensor_msgs.Range) {
+			if msg == nil {
+				return
+			}
+			r := float64(msg.Range)
+			c.mu.Lock()
+			if math.IsInf(r, 0) || math.IsNaN(r) || r < float64(msg.MinRange) || r > float64(msg.MaxRange) {
+				c.sensors.TofM = -1
+			} else {
+				c.sensors.TofM = r
+			}
+			c.sensors.TofOK = true
+			c.mu.Unlock()
+		},
+	})
+	if err != nil {
+		c.Log("warn", fmt.Sprintf("tof subscriber: %v", err))
+	}
+
+	_, err = goroslib.NewSubscriber(goroslib.SubscriberConf{
+		Node:      n,
+		Topic:     "/SensorNode/imu",
+		QueueSize: 1,
+		Callback: func(msg *sensor_msgs.Imu) {
+			if msg == nil {
+				return
+			}
+			ax := msg.LinearAcceleration.X
+			ay := msg.LinearAcceleration.Y
+			az := msg.LinearAcceleration.Z
+			if ax == 0 && ay == 0 && az == 0 {
+				return
+			}
+			pitch := math.Atan2(-ax, math.Hypot(ay, az)) * 180 / math.Pi
+			roll := math.Atan2(ay, az) * 180 / math.Pi
+			c.mu.Lock()
+			// EMA smoothing: the IMU streams at ~33Hz and raw accel is noisy.
+			const a = 0.2
+			if !c.sensors.IMUOK {
+				c.sensors.PitchDeg, c.sensors.RollDeg = pitch, roll
+			} else {
+				c.sensors.PitchDeg += a * (pitch - c.sensors.PitchDeg)
+				c.sensors.RollDeg += a * (roll - c.sensors.RollDeg)
+			}
+			c.sensors.IMUOK = true
+			c.mu.Unlock()
+		},
+	})
+	if err != nil {
+		c.Log("warn", fmt.Sprintf("imu subscriber: %v", err))
+	}
+
+	_, err = goroslib.NewSubscriber(goroslib.SubscriberConf{
+		Node:      n,
+		Topic:     "/MotorNode/baselink_odom_relative",
+		QueueSize: 1,
+		Callback: func(msg *nav_msgs.Odometry) {
+			if msg == nil {
+				return
+			}
+			x := msg.Pose.Pose.Position.X
+			y := msg.Pose.Pose.Position.Y
+			speed := math.Hypot(msg.Twist.Twist.Linear.X, msg.Twist.Twist.Linear.Y)
+			c.mu.Lock()
+			if c.odomInit {
+				step := math.Hypot(x-c.odomX, y-c.odomY)
+				// Skip resets/teleports; real steps between messages are tiny.
+				if step < 1 {
+					c.sensors.TripM += step
+				}
+			}
+			c.odomX, c.odomY, c.odomInit = x, y, true
+			c.sensors.SpeedMS = speed
+			c.sensors.OdomOK = true
+			c.mu.Unlock()
+		},
+	})
+	if err != nil {
+		c.Log("warn", fmt.Sprintf("odom subscriber: %v", err))
+	}
+}
+
+// Sensors returns the latest HUD instrument snapshot.
+func (c *Client) Sensors() SensorState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sensors
 }
 
 func (c *Client) Close() {
@@ -438,6 +560,23 @@ func (c *Client) Tracked() bool {
 	return c.tracked
 }
 
+// SetSwapLR mirrors turn/strafe commands to compensate for physically
+// swapped left/right motor connectors.
+func (c *Client) SetSwapLR(swap bool) {
+	c.mu.Lock()
+	c.swapLR = swap
+	c.mu.Unlock()
+	if swap {
+		c.Log("info", "drive: L/R motor swap compensation on")
+	}
+}
+
+func (c *Client) SwapLR() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.swapLR
+}
+
 func (c *Client) Resolution() (int, int) {
 	return int(atomic.LoadInt32(&c.width)), int(atomic.LoadInt32(&c.height))
 }
@@ -543,6 +682,12 @@ func (c *Client) Drive(x, y, az float64) error {
 	if c.Tracked() {
 		x = 0
 	}
+	if c.SwapLR() {
+		// Left/right motor connectors are physically swapped on this robot:
+		// forward/back are unaffected, but turn (and strafe) mirror.
+		az = -az
+		x = -x
+	}
 	moving := x != 0 || y != 0 || az != 0
 	c.mu.Lock()
 	was := c.wasDriving
@@ -614,6 +759,24 @@ func (c *Client) SetCameraLight(level int32) error {
 		level = 100
 	}
 	return c.setVideoInts(map[string]int32{"cameraLight": level})
+}
+
+// SetVideoResolution changes the on-board H.264 stream size and framerate.
+// Framerate is expressed as a period fraction num/den, so fps = den/num; we
+// pin num=1 and use den as the frames-per-second value.
+func (c *Client) SetVideoResolution(width, height, fps int32) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("invalid resolution %dx%d", width, height)
+	}
+	if fps <= 0 || fps > 120 {
+		fps = 30
+	}
+	return c.setVideoInts(map[string]int32{
+		"image_width":   width,
+		"image_height":  height,
+		"image_fps_num": 1,
+		"image_fps_den": fps,
+	})
 }
 
 func (c *Client) SetVideoMode(mode, light int32) error {

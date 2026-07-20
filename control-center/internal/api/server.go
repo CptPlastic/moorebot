@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,11 +17,12 @@ import (
 )
 
 type Server struct {
-	ROS    *ros.Client
-	BotSSH *botcfg.Client
-	Wifi   *botcfg.WifiCache
-	UI     *uiStore
-	Static http.FileSystem
+	ROS     *ros.Client
+	BotSSH  *botcfg.Client
+	Wifi    *botcfg.WifiCache
+	UI      *uiStore
+	Static  http.FileSystem
+	Version string
 
 	cameraMu   sync.Mutex
 	pilotMu    sync.Mutex
@@ -38,6 +40,7 @@ type driveMsg struct {
 	AZ   float64 `json:"az"`
 	Spd  float64 `json:"spd"`
 	Cmd  string  `json:"cmd"`
+	On   bool    `json:"on"`
 	T    int64   `json:"t"`
 }
 
@@ -105,7 +108,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	client := s.CurrentROS()
 	width, height := client.Resolution()
-	batt := client.Battery()
+	// Prefer the kernel fuel gauge (sampled over SSH): the SensorNode ROS
+	// topic runs far too optimistic (e.g. 59% while the BMS is about to cut
+	// power at a real 18%). Fall back to ROS only when SSH data is stale.
+	rosBatt := client.Battery()
+	batt := map[string]any{
+		"percent": rosBatt.Percent,
+		"label":   rosBatt.Label,
+		"source":  "ros",
+	}
+	if s.Wifi != nil {
+		if kb, ok := s.Wifi.GetBattery(); ok {
+			batt["percent"] = kb.Percent
+			batt["label"] = strings.ToLower(kb.Status)
+			batt["voltageMV"] = kb.VoltageMV
+			batt["source"] = "kernel"
+		}
+	}
 	night := client.Night()
 	nightMode, cameraLight := client.VideoMode()
 	modeLabel := map[int32]string{0: "color", 1: "ir", 2: "auto"}[nightMode]
@@ -118,12 +137,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		nightOut["brightness"] = night.Brightness
 	}
 	var wifi any
+	tempC := 0
 	if s.Wifi != nil {
 		wifi = s.Wifi.Get()
+		tempC = s.Wifi.GetTempC()
 	}
 	ui := s.UI.Get()
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":         true,
+		"version":    s.Version,
 		"connected":  client.Connected(),
 		"battery":    batt,
 		"codec":      "h264+aac",
@@ -136,6 +158,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"dock":       client.Dock(),
 		"night":      nightOut,
 		"wifi":       wifi,
+		"sensors":    client.Sensors(),
+		"tempC":      tempC,
 		"ui":         ui,
 	})
 }
@@ -304,6 +328,12 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "light_down":
 		_, light := client.VideoMode()
 		err = s.setCameraLight(light - 10)
+	case "quality_high":
+		err = s.setResolution(1920, 1080, 30)
+	case "quality_medium":
+		err = s.setResolution(1280, 720, 30)
+	case "quality_low":
+		err = s.setResolution(640, 480, 15)
 	case "refresh_night":
 		client.RefreshNight()
 	default:
@@ -318,10 +348,17 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "cmd": body.Cmd})
 }
 
+func (s *Server) setResolution(width, height, fps int32) error {
+	client := s.CurrentROS()
+	client.Log("info", fmt.Sprintf("video → %dx%d @ %dfps", width, height, fps))
+	return client.SetVideoResolution(width, height, fps)
+}
+
 func isCameraAction(cmd string) bool {
 	switch cmd {
 	case "ir_on", "ir_off", "color", "ir_auto",
-		"ir_light_on", "ir_light_off", "light_up", "light_down":
+		"ir_light_on", "ir_light_off", "light_up", "light_down",
+		"quality_high", "quality_medium", "quality_low":
 		return true
 	default:
 		return false
@@ -374,6 +411,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	var writeMu sync.Mutex
 	var sendingVid atomic.Bool
 	var sendingAud atomic.Bool
+	// Audio streams only while the client wants it; muting stops the AAC bytes
+	// entirely to save bandwidth on weak links. Default on.
+	var audioOn atomic.Bool
+	audioOn.Store(true)
 
 	writeBin := func(buf []byte) {
 		writeMu.Lock()
@@ -426,6 +467,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer unsubVid()
 
 	unsubAud := client.OnAAC(func(pkt ros.AudioPacket) {
+		if !audioOn.Load() {
+			return
+		}
 		if !sendingAud.CompareAndSwap(false, true) {
 			return
 		}
@@ -440,11 +484,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer unsubAud()
 
 	if viewOnly {
-		// Media-only socket — just keep alive until disconnect.
+		// Media-only socket — accept audio on/off toggles, ignore drive.
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
 				client.Log("info", "view client disconnected")
 				return
+			}
+			var msg driveMsg
+			if json.Unmarshal(data, &msg) == nil && msg.Type == "audio" {
+				audioOn.Store(msg.On)
 			}
 		}
 	}
@@ -491,6 +540,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if msg.Type == "ping" {
 			writeJSON(map[string]any{"type": "pong", "t": msg.T})
+			continue
+		}
+		if msg.Type == "audio" {
+			audioOn.Store(msg.On)
 			continue
 		}
 		if msg.Type == "action" {

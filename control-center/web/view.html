@@ -15,10 +15,6 @@
       opacity: 0; transition: opacity 0.2s;
     }
     .stage:hover .chrome, .chrome:focus-within { opacity: 1; }
-    button {
-      background: rgba(20,24,28,0.9); color: #e7ecef; border: 1px solid #3a424b;
-      padding: 7px 11px; cursor: pointer; font: inherit;
-    }
     .pill { opacity: 0.9; }
     .pill.on { color: #3dd6c6; }
     .pill.bad { color: #ff6b4a; }
@@ -31,9 +27,7 @@
     <div class="chrome">
       <span id="status" class="pill">connecting…</span>
       <span id="night" class="pill">cam: —</span>
-      <button type="button" id="btnMute">Mute</button>
-      <button type="button" id="btnFs">Fullscreen</button>
-      <span class="hint">Live view · drive on control</span>
+      <span class="hint">M mute · F fullscreen · drive on control</span>
     </div>
   </div>
   <script type="module">
@@ -52,16 +46,26 @@
     });
     media.setGain(6);
 
-    document.getElementById('btnMute').addEventListener('click', async () => {
+    let ws;
+    function sendAudioState() {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'audio', on: !muted }));
+    }
+    async function toggleMute() {
       muted = !muted;
       media.setMuted(muted);
-      document.getElementById('btnMute').textContent = muted ? 'Unmute' : 'Mute';
+      sendAudioState();
       if (!muted) await media.unlockAudio();
-    });
-    document.getElementById('btnFs').addEventListener('click', () => {
+    }
+    function toggleFullscreen() {
       if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
       else document.exitFullscreen().catch(() => {});
+    }
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'm' || e.key === 'M') toggleMute();
+      if (e.key === 'f' || e.key === 'F') toggleFullscreen();
     });
+    // Double-click anywhere on the video = fullscreen (handy without keyboard).
+    document.getElementById('view').addEventListener('dblclick', toggleFullscreen);
     window.addEventListener('pointerdown', () => media.unlockAudio(), { once: true });
 
     function applyUI(ui) {
@@ -84,9 +88,9 @@
 
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}/ws?view=1`);
+      ws = new WebSocket(`${proto}://${location.host}/ws?view=1`);
       ws.binaryType = 'arraybuffer';
-      ws.onopen = () => { status.textContent = 'live'; status.className = 'pill on'; };
+      ws.onopen = () => { status.textContent = 'live'; status.className = 'pill on'; sendAudioState(); };
       ws.onclose = () => { status.textContent = 'reconnecting…'; media.resetKey(); setTimeout(connect, 1000); };
       ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') return;

@@ -211,6 +211,7 @@ export function createMediaPipeline({ canvas, onStatus, reticle = true }) {
   let vConfigured = false, aConfigured = false;
   let waitingKey = true;
   let vts = 0, ats = 0;
+  let vW = 0, vH = 0;
   let audioMuted = false;
   let audioCtx = null;
   let gainNode = null;
@@ -237,8 +238,7 @@ export function createMediaPipeline({ canvas, onStatus, reticle = true }) {
       setStatus(window.isSecureContext ? 'h264: no WebCodecs' : 'h264: needs localhost', false);
       throw new Error('no VideoDecoder');
     }
-    if (vdec && vConfigured) return;
-    if (vdec) { try { vdec.close(); } catch (_) {} }
+    if (vdec) { try { vdec.close(); } catch (_) {} vConfigured = false; }
     vdec = new VideoDecoder({
       output: (frame) => {
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
@@ -269,6 +269,8 @@ export function createMediaPipeline({ canvas, onStatus, reticle = true }) {
     if (!cfg) { setStatus('h264: unsupported', false); throw new Error('no h264'); }
     vdec.configure(cfg);
     vConfigured = true;
+    vW = cfg.codedWidth;
+    vH = cfg.codedHeight;
     setStatus('h264: ready', true);
   }
 
@@ -370,8 +372,13 @@ export function createMediaPipeline({ canvas, onStatus, reticle = true }) {
       const width = (u8[2] << 8) | u8[3];
       const height = (u8[4] << 8) | u8[5];
       const payload = u8.subarray(6);
-      if (waitingKey && !key) return;
-      try { await ensureVideo(width, height); } catch (_) { return; }
+      // A resolution switch needs a fresh keyframe (new SPS/PPS) and a
+      // decoder reconfigure; hold delta frames at the old size until it lands.
+      const dimsChanged = vConfigured && width && height && (width !== vW || height !== vH);
+      if ((waitingKey || dimsChanged) && !key) return;
+      if (!vdec || !vConfigured || dimsChanged) {
+        try { await ensureVideo(width, height); } catch (_) { return; }
+      }
       if (waitingKey && key) {
         waitingKey = false;
         setStatus('h264: live', true);

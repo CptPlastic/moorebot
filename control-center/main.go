@@ -28,6 +28,9 @@ var webFS embed.FS
 //go:embed assets/icon.ico
 var iconICO []byte
 
+// version is stamped at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	rosMaster := flag.String("ros", "SCOUT-F9C3D0:11311", "Scout hostname/IP and ROS master port")
 	host := flag.String("host", "", "This PC LAN IP (auto-detect if empty)")
@@ -37,6 +40,7 @@ func main() {
 	tray := flag.Bool("tray", true, "run in system tray")
 	openBrowser := flag.Bool("open", true, "open control UI in browser on start")
 	useTailscale := flag.Bool("tailscale", true, "enable Tailscale Serve HTTPS (Tailnet only)")
+	swapLR := flag.Bool("swap-lr", true, "compensate for swapped left/right motor wiring (mirrors turn/strafe)")
 	console := flag.Bool("console", false, "attach a console for logs (useful with windowsgui builds)")
 	flag.Parse()
 
@@ -44,6 +48,7 @@ func main() {
 		attachConsole()
 	}
 	setupLogging(*console)
+	log.Printf("build: %s", version)
 
 	scoutHost, rosPort, err := net.SplitHostPort(*rosMaster)
 	if err != nil {
@@ -77,7 +82,7 @@ func main() {
 	// RSSI has no native ROS topic on Scout; sample it sparingly over SSH.
 	wifiCache.Start(10 * time.Second)
 
-	srv := &api.Server{ROS: client, BotSSH: bot, Wifi: wifiCache, UI: api.NewUIStore(), Static: http.FS(sub)}
+	srv := &api.Server{ROS: client, BotSSH: bot, Wifi: wifiCache, UI: api.NewUIStore(), Static: http.FS(sub), Version: version}
 	httpServer := &http.Server{Addr: *listen, Handler: srv.Handler()}
 
 	go func() {
@@ -89,7 +94,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
-	go connectScout(srv, bot, *rosMaster, *host, rosPort)
+	go connectScout(srv, bot, *rosMaster, *host, rosPort, *swapLR)
 
 	// Wait briefly for listen before opening browser / Tailscale.
 	time.Sleep(300 * time.Millisecond)
@@ -185,10 +190,11 @@ type scoutConnection struct {
 	localHost string
 }
 
-func connectScout(server *api.Server, bot *botcfg.Client, master, configuredLocalHost, rosPort string) {
+func connectScout(server *api.Server, bot *botcfg.Client, master, configuredLocalHost, rosPort string, swapLR bool) {
 	for {
 		connection := waitForScout(master, configuredLocalHost)
 		client := connection.client
+		client.SetSwapLR(swapLR)
 		server.SetROS(client)
 		client.Log("info", "Scout connected")
 
@@ -229,6 +235,16 @@ func configureConnectedScout(client *ros.Client, bot *botcfg.Client) {
 		log.Printf("drive base: track=%v (1=tracked 0=mecanum)", motion.Track == 1)
 	} else {
 		log.Printf("warn: could not read motion config: %v", err)
+	}
+	// Start every session at a light 720p30 encode instead of whatever the
+	// Scout last persisted (often 1080p). 1080p H.264 encoding is the heaviest
+	// continuous load on the Scout's little CPU; 720p cuts CPU, heat, and
+	// bitrate substantially and the client can still auto-drop to 480p on a
+	// weak link. Users can bump back to 1080p from the UI when the link is good.
+	if err := client.SetVideoResolution(1280, 720, 30); err != nil {
+		log.Printf("warn: could not set default video resolution: %v", err)
+	} else {
+		log.Printf("video: default 720p30 (light encode; raise from UI on strong link)")
 	}
 }
 
